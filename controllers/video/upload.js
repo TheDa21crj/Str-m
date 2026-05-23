@@ -31,9 +31,11 @@ const upload = async (req, res, next) => {
     }
 
     const hasAudio = stdout.trim().length > 0;
-    const totalVariants = 8;
+    
+    // Streamlined to 5 core variants for dramatic speedup (4K, 1080p, 720p, 480p, 360p)
+    const totalVariants = 5;
 
-    // Pre-create variant directories (v0 to v7)
+    // Pre-create the directory structure for our 5 variant streams
     for (let i = 0; i < totalVariants; i++) {
       const variantDir = path.join(outputPath, `v${i}`);
       if (!fs.existsSync(variantDir)) {
@@ -41,71 +43,39 @@ const upload = async (req, res, next) => {
       }
     }
 
+    // Map video and audio indexes smoothly across 5 streams
     const streamMap = hasAudio
-      ? "v:0,a:0 v:1,a:1 v:2,a:2 v:3,a:3 v:4,a:4 v:5,a:5 v:6,a:6 v:7,a:7"
-      : "v:0 v:1 v:2 v:3 v:4 v:5 v:6 v:7";
+      ? "v:0,a:0 v:1,a:1 v:2,a:2 v:3,a:3 v:4,a:4"
+      : "v:0 v:1 v:2 v:3 v:4";
 
-    // Base FFmpeg args
+    // Optimized FFmpeg arguments configuration 
     const ffmpegArgs = [
-      "-i",
-      videoPath,
-      "-preset",
-      "fast",
-      "-g",
-      "48",
-      "-sc_threshold",
-      "0",
+      "-i", videoPath,
+      "-preset", "superfast", // Maximize configuration speedup
+      "-g", "48",
+      "-sc_threshold", "0"
     ];
 
-    // FIX: Map the single input stream (0:v:0) exactly 8 times
-    // This populates the internal streams so var_stream_map can find v:0 through v:7
+    // Explicitly clone primary video track to 5 separate internal slots
     for (let i = 0; i < totalVariants; i++) {
       ffmpegArgs.push("-map", "0:v:0");
     }
 
-    // Map the audio stream 8 times if it exists
+    // Explicitly clone audio track to 5 slots if present
     if (hasAudio) {
       for (let i = 0; i < totalVariants; i++) {
         ffmpegArgs.push("-map", "0:a:0");
       }
     }
 
-    // Apply the video filters explicitly targeting each generated stream index
+    // Build scaled layers targeting Apple Silicon VideoToolbox hardware matrix
     ffmpegArgs.push(
-      "-filter:v:0",
-      "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:0",
-      "20M",
-      "-filter:v:1",
-      "scale=2560:1440:force_original_aspect_ratio=decrease,pad=2560:1440:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:1",
-      "12M",
-      "-filter:v:2",
-      "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:2",
-      "5M",
-      "-filter:v:3",
-      "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:3",
-      "2.5M",
-      "-filter:v:4",
-      "scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:4",
-      "1M",
-      "-filter:v:5",
-      "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:5",
-      "750k",
-      "-filter:v:6",
-      "scale=426:240:force_original_aspect_ratio=decrease,pad=426:240:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:6",
-      "400k",
-      "-filter:v:7",
-      "scale=256:144:force_original_aspect_ratio=decrease,pad=256:144:(ow-iw)/2:(oh-ih)/2",
-      "-b:v:7",
-      "200k",
-      "-c:v",
-      "libx264",
+      "-filter:v:0", "scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2", "-b:v:0", "20M",
+      "-filter:v:1", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2", "-b:v:1", "5M",
+      "-filter:v:2", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2",   "-b:v:2", "2.5M",
+      "-filter:v:3", "scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2",     "-b:v:3", "1M",
+      "-filter:v:4", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2",     "-b:v:4", "750k",
+      "-c:v", "h264_videotoolbox" // Hardware Acceleration Engine
     );
 
     if (hasAudio) {
@@ -114,28 +84,23 @@ const upload = async (req, res, next) => {
       ffmpegArgs.push("-an");
     }
 
-    // Append HLS Packaging parameters
+    // Packaging execution flags to segment master list targets
     ffmpegArgs.push(
-      "-f",
-      "hls",
-      "-hls_time",
-      "10",
-      "-hls_playlist_type",
-      "vod",
-      "-master_pl_name",
-      "master.m3u8",
-      "-hls_segment_filename",
-      `${outputPath}/v%v/segment%03d.ts`,
-      "-var_stream_map",
-      streamMap,
-      `${outputPath}/v%v/index.m3u8`,
+      "-f", "hls",
+      "-hls_time", "10",
+      "-hls_playlist_type", "vod",
+      "-master_pl_name", "master.m3u8",
+      "-hls_segment_filename", `${outputPath}/v%v/segment%03d.ts`,
+      "-var_stream_map", streamMap,
+      `${outputPath}/v%v/index.m3u8`
     );
 
-    console.log("Starting FFmpeg processing via spawn...");
+    console.log("Starting Hardware-Accelerated FFmpeg processing...");
 
     const ffmpegProcess = spawn("ffmpeg", ffmpegArgs);
 
     ffmpegProcess.stderr.on("data", (data) => {
+      // Un-comment to trace rapid encoding progress in the console log
       console.log(`FFmpeg Log: ${data.toString()}`);
     });
 
