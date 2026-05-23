@@ -1,11 +1,11 @@
 const mongoose = require("mongoose");
 
 const videoSchema = new mongoose.Schema(
-    {userID:{
-        
-        type: String,
-        default: "",
-  },
+  {
+    userID: {
+      type: String,
+      default: "",
+    },
     contentId: {
       type: String,
       required: true,
@@ -28,19 +28,17 @@ const videoSchema = new mongoose.Schema(
       type: String,
       enum: ["processing", "completed", "failed"],
       default: "processing",
-      index: true, // Useful for filtering working queues or stuck jobs
+      index: true,
     },
     hasAudio: {
       type: Boolean,
       default: false,
     },
-    // NEW: Analytical Metadata
     metadata: {
       duration: { type: Number, default: 0 }, // In seconds
       size: { type: Number, default: 0 }, // Original file size in bytes
       codec: { type: String, default: "" }, // Input codec (e.g., av1, h264)
     },
-    // NEW: Granular track tracking for variant checkpoints
     availableResolutions: {
       type: [String],
       enum: ["2160p", "1440p", "1080p", "720p", "480p", "360p", "240p", "144p"],
