@@ -7,6 +7,57 @@ const { exec, spawn } = require("child_process");
 // model
 const video = require("../../model/video");
 
+// appwrite
+const sdk = require("node-appwrite");
+const { Client, Storage, ID, Permission, Role } = require("node-appwrite");
+const { InputFile } = require("node-appwrite/file");
+
+const client = new Client()
+  .setEndpoint("https://cloud.appwrite.io/v1")
+  .setProject(process.env.PROJECT_ID)
+  .setKey(process.env.SECRET_KEY);
+
+const storage = new Storage(client);
+
+/**
+ * Helper function to recursively read a local directory and upload everything to Appwrite Storage.
+ * It maps file paths to Appwrite filenames to preserve the directory layout structure.
+ */
+const uploadDirectoryToAppwrite = async (localDirPath, baseAppwritePath) => {
+  const entries = fs.readdirSync(localDirPath, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const fullLocalPath = path.join(localDirPath, entry.name);
+    // Construct a path string for Appwrite filename mapping (e.g., m3u8Data/uuid/v0/index.m3u8)
+    const relativeAppwritePath = `${baseAppwritePath}/${entry.name}`;
+
+    if (entry.isDirectory()) {
+      // Recurse into variant directories (v0, v1, etc.)
+      await uploadDirectoryToAppwrite(fullLocalPath, relativeAppwritePath);
+    } else if (entry.isFile()) {
+      try {
+        if (!fs.existsSync(fullLocalPath)) continue;
+
+        // Uploading each segment/playlist matching your core reference blueprint
+        await storage.createFile(
+          process.env.BUCKET_ID,
+          ID.unique(),
+          InputFile.fromPath(fullLocalPath, relativeAppwritePath),
+          [
+            Permission.read(Role.any()), // Public read permissions for HLS video player consumption
+            Permission.update(Role.users()),
+            Permission.delete(Role.users()),
+          ],
+        );
+        console.log(`Successfully synced to Appwrite: ${relativeAppwritePath}`);
+      } catch (uploadErr) {
+        console.error(`Appwrite sync failed for ${entry.name}:`, uploadErr);
+        throw uploadErr; // Propagate up to trigger process failure catchers
+      }
+    }
+  }
+};
+
 const upload = async (req, res, next) => {
   console.log("openCanvans: Uploading Video... ");
 
@@ -78,7 +129,9 @@ const upload = async (req, res, next) => {
       "144p",
     ];
     const totalVariants = resolutions.length;
-    const videoUrl = `http://127.0.0.1:5000/storage/m3u8Data/${contentId}/master.m3u8`;
+
+    // Construct the fallback videoUrl structure referencing your Appwrite storage endpoint bucket file scheme
+    const videoUrl = `${client.config.endpoint}/storage/buckets/${process.env.BUCKET_ID}/files?search=${contentId}`;
 
     let videoDoc;
     try {
@@ -221,14 +274,43 @@ const upload = async (req, res, next) => {
         return;
       }
 
-      console.log("Processing completed successfully.");
-      await video.updateOne(
-        { contentId },
-        {
-          status: "completed",
-          availableResolutions: resolutions,
-        },
+      console.log(
+        "Local processing completed. Starting Appwrite Cloud Bucket Upload Synchronization...",
       );
+
+      try {
+        // Core Update: Push all local folder tracks, playlists, and fragmented segments directly onto Appwrite Storage
+        await uploadDirectoryToAppwrite(outputPath, `m3u8Data/${contentId}`);
+        console.log(
+          "Appwrite Storage upload synchronization completed successfully.",
+        );
+
+        // Mark document status as completed only after Appwrite successfully processes the entire payload tree
+        await video.updateOne(
+          { contentId },
+          {
+            status: "completed",
+            availableResolutions: resolutions,
+          },
+        );
+
+        // Optional Cleanup: Wipe the temporary local files from your app server's storage disk to keep things tidy
+        fs.rmSync(outputPath, { recursive: true, force: true });
+        if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
+      } catch (uploadError) {
+        console.error(
+          "Failed to sync transcoded files to Appwrite Storage:",
+          uploadError,
+        );
+        await video.updateOne(
+          { contentId },
+          {
+            status: "failed",
+            errorReason:
+              "Transcoded asset pipeline failed to synchronize onto Cloud Storage.",
+          },
+        );
+      }
     });
 
     ffmpegProcess.on("error", async (err) => {
