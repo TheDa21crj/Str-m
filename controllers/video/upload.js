@@ -1,8 +1,12 @@
-const multer = require("multer");
-const { v4: uuidv4 } = require("uuid");
+const { exec, spawn } = require("child_process");
+
+// file
 const fs = require("fs");
 const path = require("path");
-const { exec, spawn } = require("child_process");
+const multer = require("multer");
+
+// id
+const { v4: uuidv4 } = require("uuid");
 
 // model
 const video = require("../../model/video");
@@ -12,47 +16,81 @@ const sdk = require("node-appwrite");
 const { Client, Storage, ID, Permission, Role } = require("node-appwrite");
 const { InputFile } = require("node-appwrite/file");
 
+// Initialize Client and increase timeout thresholds to prevent dropped network pipes during large chunk transmissions
 const client = new Client()
   .setEndpoint("https://cloud.appwrite.io/v1")
   .setProject(process.env.PROJECT_ID)
   .setKey(process.env.SECRET_KEY);
 
+// FIX: Corrected casing from setTIMEOUT to setTimeout
+if (typeof client.setTimeout === "function") {
+  client.setTimeout(300000); // 5-minute timeout window
+} else {
+  // Fallback fallback if your specific SDK version handles it natively via properties
+  client.timeout = 300000;
+}
+
 const storage = new Storage(client);
 
+// Simple utility function to handle exponential delays during retries
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
- * Helper function to recursively read a local directory and upload everything to Appwrite Storage.
- * It maps file paths to Appwrite filenames to preserve the directory layout structure.
+ * Enhanced recursive directory uploader featuring a retry policy and progressive backoff
+ * to handle transient network issues or 499 client-dropped sockets natively.
  */
 const uploadDirectoryToAppwrite = async (localDirPath, baseAppwritePath) => {
   const entries = fs.readdirSync(localDirPath, { withFileTypes: true });
 
   for (const entry of entries) {
     const fullLocalPath = path.join(localDirPath, entry.name);
-    // Construct a path string for Appwrite filename mapping (e.g., m3u8Data/uuid/v0/index.m3u8)
     const relativeAppwritePath = `${baseAppwritePath}/${entry.name}`;
 
     if (entry.isDirectory()) {
-      // Recurse into variant directories (v0, v1, etc.)
       await uploadDirectoryToAppwrite(fullLocalPath, relativeAppwritePath);
     } else if (entry.isFile()) {
-      try {
-        if (!fs.existsSync(fullLocalPath)) continue;
+      if (!fs.existsSync(fullLocalPath)) continue;
 
-        // Uploading each segment/playlist matching your core reference blueprint
-        await storage.createFile(
-          process.env.BUCKET_ID,
-          ID.unique(),
-          InputFile.fromPath(fullLocalPath, relativeAppwritePath),
-          [
-            Permission.read(Role.any()), // Public read permissions for HLS video player consumption
-            Permission.update(Role.users()),
-            Permission.delete(Role.users()),
-          ],
-        );
-        console.log(`Successfully synced to Appwrite: ${relativeAppwritePath}`);
-      } catch (uploadErr) {
-        console.error(`Appwrite sync failed for ${entry.name}:`, uploadErr);
-        throw uploadErr; // Propagate up to trigger process failure catchers
+      const maxRetries = 3;
+      let attempt = 0;
+      let success = false;
+
+      while (attempt < maxRetries && !success) {
+        try {
+          await storage.createFile(
+            process.env.BUCKET_ID,
+            ID.unique(),
+            InputFile.fromPath(fullLocalPath, relativeAppwritePath),
+            [
+              Permission.read(Role.any()),
+              Permission.update(Role.users()),
+              Permission.delete(Role.users()),
+            ],
+          );
+
+          console.log(
+            `Successfully synced to Appwrite: ${relativeAppwritePath}`,
+          );
+          success = true;
+        } catch (uploadErr) {
+          attempt++;
+          console.warn(
+            `⚠️ Appwrite upload attempt ${attempt} failed for ${entry.name}. Code: ${uploadErr.code}. Reason: ${uploadErr.message}`,
+          );
+
+          if (attempt >= maxRetries) {
+            console.error(
+              `❌ Permanent failure uploading ${entry.name} after ${maxRetries} attempts.`,
+            );
+            throw uploadErr; // Propagate exception to fail the overarching sync step cleanly
+          }
+
+          const backoffTime = attempt * 2000;
+          console.log(
+            `Retrying ${entry.name} in ${backoffTime / 1000} seconds...`,
+          );
+          await delay(backoffTime);
+        }
       }
     }
   }
@@ -76,7 +114,6 @@ const upload = async (req, res, next) => {
   console.log("videoPath - ", videoPath);
   console.log("outputPath - ", outputPath);
 
-  // FIXED: Simplified and robust ffprobe entry request to capture all stream properties cleanly
   const probeCmd = `ffprobe -v error -show_entries stream=codec_name,codec_type -show_entries format=duration,size -of json "${videoPath}"`;
 
   exec(probeCmd, async (probeErr, stdout) => {
@@ -94,12 +131,10 @@ const upload = async (req, res, next) => {
       const probeData = JSON.parse(stdout);
 
       if (probeData.streams) {
-        // FIXED: Deterministic check for an audio track using standard codec_type property
         hasAudio = probeData.streams.some(
           (stream) => stream.codec_type === "audio",
         );
 
-        // Find the video codec profile name
         const videoStream = probeData.streams.find(
           (stream) => stream.codec_type === "video",
         );
@@ -130,7 +165,6 @@ const upload = async (req, res, next) => {
     ];
     const totalVariants = resolutions.length;
 
-    // Construct the fallback videoUrl structure referencing your Appwrite storage endpoint bucket file scheme
     const videoUrl = `${client.config.endpoint}/storage/buckets/${process.env.BUCKET_ID}/files?search=${contentId}`;
 
     let videoDoc;
@@ -223,7 +257,6 @@ const upload = async (req, res, next) => {
       "h264_videotoolbox",
     );
 
-    // FIXED: Ensured configurations cleanly apply the audio codec parameters instead of -an strip flag
     if (hasAudio) {
       ffmpegArgs.push("-c:a", "aac", "-ar", "48000", "-async", "1");
     } else {
@@ -279,13 +312,13 @@ const upload = async (req, res, next) => {
       );
 
       try {
-        // Core Update: Push all local folder tracks, playlists, and fragmented segments directly onto Appwrite Storage
+        // Core Execution: Begin syncing directory structural payload directly into Appwrite Cloud Storage
         await uploadDirectoryToAppwrite(outputPath, `m3u8Data/${contentId}`);
         console.log(
           "Appwrite Storage upload synchronization completed successfully.",
         );
 
-        // Mark document status as completed only after Appwrite successfully processes the entire payload tree
+        // Update record status to completed only if the storage synchronization succeeds without permanent crashes
         await video.updateOne(
           { contentId },
           {
@@ -294,12 +327,12 @@ const upload = async (req, res, next) => {
           },
         );
 
-        // Optional Cleanup: Wipe the temporary local files from your app server's storage disk to keep things tidy
+        // Cleanup: Clear local workspace files to preserve space on the app container
         fs.rmSync(outputPath, { recursive: true, force: true });
         if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
       } catch (uploadError) {
         console.error(
-          "Failed to sync transcoded files to Appwrite Storage:",
+          "Failed to sync transcoded files to Appwrite Storage after retry sequences:",
           uploadError,
         );
         await video.updateOne(
